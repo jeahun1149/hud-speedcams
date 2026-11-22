@@ -1,0 +1,34 @@
+name: Update speed cameras
+on:
+  schedule:
+    - cron: "0 20 * * *"   # 매일 UTC 20시 = 한국 새벽 5시
+  workflow_dispatch:        # Actions 탭에서 수동 실행
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: cams-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: 이전 버전 받기
+        run: |
+          mkdir -p dist
+          gh release download "$TAG" -p version.json -D dist || echo "첫 실행"
+      - name: 데이터 생성
+        id: build
+        env:
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+        run: python build_cams.py
+      - name: 릴리스 업로드
+        if: steps.build.outputs.changed == 'true'
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" -t "Speed camera DB" -n "자동 갱신 (cams.bin + version.json)"
+          gh release upload "$TAG" dist/cams.bin dist/version.json --clobber
