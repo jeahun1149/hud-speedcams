@@ -9,9 +9,12 @@ HUD 과속 단속카메라 DB 생성기
   - 단속 방향: OpenStreetMap 도로 지도(Geofabrik, 약 250 MB, dist/ 에 받아 둠)로 추정 (cam_dirs.py, pip install osmium)
 
 cams.bin (리틀 엔디언)
-  헤더 12바이트: "CAM1" + uint32 레코드 수 + uint32 레코드 크기(12)
-  레코드 12바이트: int32 위도x1e6, int32 경도x1e6, uint8 제한속도(km/h), uint8 단속구분, uint8 도로노선방향,
+  헤더 12바이트: "CAM2" + uint32 레코드 수 + uint32 레코드 크기(12)   (2026-11-25 전엔 "CAM1": 구간단속 바이트 없음)
+  레코드 12바이트: int32 위도x1e6, int32 경도x1e6, uint8 제한속도(km/h), uint8 구간단속 A, uint8 구간단속 B,
                    uint8 단속 방향 (0 모름, 1~180 = 방향/2 + 1, 북 0° 시계방향 — 예전 파일은 0 = 모름)
+    구간단속 (2026-11-25, 예전엔 이 두 바이트가 단속구분·도로노선방향 — HUD 펌웨어는 안 썼음):
+      A 의 아래 2비트 = 위치 (0 구간단속 아님, 1 시점, 2 종점), 구간 길이(10 m 단위, 0 = 모름) = (A >> 2) << 8 | B
+      원본 "단속구간위치구분"(1/01 시점, 2/02 종점), "과속단속구간길이"(100 미만 = km, 100 이상 = m 로 적힌 곳이 있음)
   위도 순 정렬, 중복 제거
 version.json: version, count, size, sha256
 """
@@ -38,6 +41,8 @@ FIELD_LON = ("longitude", "lon", "lo")
 FIELD_SPEED = ("lmttVe", "lmttSpd", "limitSpeed")
 FIELD_KIND = ("regltSe", "regltSeCd")
 FIELD_DIR = ("roadRouteDrc", "roadRouteDrcCd")
+FIELD_SEC_POS = ("regltSctnLcSe",)          # 단속구간위치구분: 1 시점, 2 종점
+FIELD_SEC_LEN = ("ovrspdRegltSctnLt",)      # 과속단속구간길이 (km, 일부 m)
 
 
 def fetch_page(key, page, tries=4):
@@ -107,6 +112,20 @@ def to_int(v, default=0):
         return default
 
 
+def section_bytes(it):
+    """구간단속 → (A, B) 바이트 (위 설명). 구간단속이 아니면 (0, 0)"""
+    pos = to_int(it.get(pick(it, FIELD_SEC_POS) or "", ""))
+    if pos not in (1, 2):
+        return 0, 0
+    try:
+        length = float(it.get(pick(it, FIELD_SEC_LEN) or "", ""))
+    except (TypeError, ValueError):
+        length = 0.0
+    m = length if length >= 100 else length * 1000      # 100 이상은 m 로 적힌 것
+    u = max(0, min(16383, round(m / 10)))
+    return pos | ((u >> 8) << 2), u & 0xFF
+
+
 def parse(items):
     if items:
         used = {k: pick(items[0], v) for k, v in
@@ -126,11 +145,14 @@ def parse(items):
             skipped += 1
             continue
         ks, kk, kd = pick(it, FIELD_SPEED), pick(it, FIELD_KIND), pick(it, FIELD_DIR)
+        sa, sb = section_bytes(it)
         recs.add((round(lat * 1e6), round(lon * 1e6),
                   max(0, min(to_int(it.get(ks)), 255)),
                   to_int(it.get(kk)) & 0xFF,
-                  to_int(it.get(kd)) & 0xFF))
+                  to_int(it.get(kd)) & 0xFF,
+                  sa, sb))
     print(f"좌표 없음/범위 밖 제외: {skipped}건")
+    print(f"구간단속: 시점 {sum(1 for r in recs if r[5] & 3 == 1)}건, 종점 {sum(1 for r in recs if r[5] & 3 == 2)}건")
     return sorted(recs)
 
 
@@ -168,8 +190,11 @@ def add_directions(recs):
 
 
 def build(recs):
+    # recs: (위도, 경도, 제한속도, 단속구분, 도로노선방향, 구간단속 A, B, 단속 방향) → 위도, 경도, 제한속도, A, B, 단속 방향
     rec = struct.Struct("<iiBBBB")                           # 마지막 1바이트 = 단속 방향 (0 모름, 1~180 = 방향/2 + 1)
-    return b"CAM1" + struct.pack("<II", len(recs), rec.size) + b"".join(rec.pack(*r) for r in recs)
+    # 머리글 CAM2 = 구간단속 바이트가 든 형식 (예전 CAM1 은 그 자리가 단속구분·도로노선방향 → 펌웨어가 구분해서 읽음)
+    return b"CAM2" + struct.pack("<II", len(recs), rec.size) + b"".join(
+        rec.pack(r[0], r[1], r[2], r[5], r[6], r[7]) for r in recs)
 
 
 def set_output(changed):
